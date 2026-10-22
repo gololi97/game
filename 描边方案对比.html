@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>音魂游｜攻击范围描边方案对比</title>
+<style>
+  :root { --paper:#fbf8ef; --ink:#2b2b2b; --muted:#7a756a; --hot:#f08a24; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #eae5d8; color: var(--ink); font-family: "Microsoft YaHei", "PingFang SC", sans-serif; }
+  header { padding: 18px 24px 4px; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0; line-height: 1.6; }
+  .sub b.blue { color: #5b7db1; }
+  .sub b.orange { color: var(--hot); }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; padding: 10px 24px 0; font-size: 13px; }
+  .controls label { display: flex; align-items: center; gap: 6px; }
+  .controls input[type=range] { width: 160px; }
+  .window { padding: 6px 24px 0; font-size: 12.5px; color: #6b5a3e; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(440px, 1fr)); gap: 16px; padding: 12px 24px 28px; }
+  .card { background: var(--paper); border-radius: 10px; box-shadow: 0 1px 3px rgba(0,0,0,.12); overflow: hidden; }
+  .card.pick { grid-column: 1 / -1; outline: 2px solid var(--hot); }
+  .card.pick canvas { max-height: 320px; object-fit: contain; }
+  .card canvas { display: block; width: 100%; aspect-ratio: 480 / 170; cursor: pointer; }
+  .meta { padding: 8px 14px 12px; border-top: 1px solid #ebe5d6; }
+  .meta h2 { font-size: 15px; margin: 0 0 4px; }
+  .meta p { font-size: 12.5px; line-height: 1.55; margin: 0; color: #4a463e; }
+  .meta .ref { color: var(--muted); margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>攻击范围描边 · 表现方案对比</h1>
+  <p class="sub">每张图都是同一个场景：左边是角色，怪物从右边走进攻击范围。<b class="blue">蓝色</b> = 平时，<b class="orange">橙色</b> = 怪物全身进入、可以攻击。点击任意画面 = 双击攻击。</p>
+</header>
+<div class="controls">
+  <label><input type="checkbox" id="auto" checked> 自动演示</label>
+  <label>手动拖动怪物位置 <input type="range" id="pos" min="0" max="1000" value="420"></label>
+  <label>范围宽度 = 怪物宽度 × <span id="wv">1.25</span> <input type="range" id="w" min="105" max="200" value="125"></label>
+</div>
+<div class="window" id="win"></div>
+<div class="grid" id="grid"></div>
+
+<script>
+const W = 480, H = 170;
+const PX = 64, EW = 40, EH = 74, ZX = 102;
+const ENTER = 2.4, ATK = 3.0, PERIOD = 5.0;
+const IDLE = [91, 125, 177], HOT = [240, 138, 36];
+const INK = '#2b2b2b', PAPER = '#fbf8ef';
+const ASSUMED_SPEED = EW * 4;
+
+const $ = q => document.querySelector(q);
+const ui = { auto: $('#auto'), pos: $('#pos'), w: $('#w'), wv: $('#wv'), win: $('#win'), grid: $('#grid') };
+let zoneMul = 1.25;
+const S = { start: performance.now(), last: performance.now(), hot: 0, inRange: false,
+            attackAt: -1e9, hitAt: -1e9, missAt: -1e9, lastHit: false, lastPhase: 0 };
+
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const groundY = x => 144 - 3.5 * Math.sin(x / 150 + 0.6);
+const hash = n => { const s = Math.sin(n * 127.1) * 43758.5453; return s - Math.floor(s); };
+function col(a, k) {
+  const c = IDLE.map((v, i) => Math.round(v + (HOT[i] - v) * k));
+  return `rgba(${c[0]},${c[1]},${c[2]},${clamp(a, 0, 1)})`;
+}
+function zone() { const w = EW * zoneMul; return { x: ZX, w, r: ZX + w, c: ZX + w / 2, h: EH + 2 }; }
+function line(ctx, x1, y1, x2, y2) { ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); }
+function groundPath(ctx, x1, x2, dy = 0) {
+  ctx.moveTo(x1, groundY(x1) + dy);
+  for (let x = x1; x <= x2; x += 4) ctx.lineTo(x, groundY(x) + dy);
+  ctx.lineTo(x2, groundY(x2) + dy);
+}
+
+function enemyPath(ctx, cx, by, sx = 1, sy = 1) {
+  const P = (x, y) => [cx + x * sx, by + y * sy];
+  ctx.beginPath();
+  ctx.moveTo(...P(-20, -20));
+  ctx.lineTo(...P(-20, -48));
+  ctx.quadraticCurveTo(...P(-20, -59), ...P(-14, -60));
+  ctx.lineTo(...P(-19, -74));
+  ctx.lineTo(...P(-6, -61));
+  ctx.lineTo(...P(6, -61));
+  ctx.lineTo(...P(19, -74));
+  ctx.lineTo(...P(14, -60));
+  ctx.quadraticCurveTo(...P(20, -59), ...P(20, -48));
+  ctx.lineTo(...P(20, -20));
+  ctx.quadraticCurveTo(...P(20, -8), ...P(8, -8));
+  ctx.lineTo(...P(-8, -8));
+  ctx.quadraticCurveTo(...P(-20, -8), ...P(-20, -20));
+  ctx.closePath();
+}
+
+// ---------- 场景状态 ----------
+function attack(now) {
+  if (now - S.hitAt < 800) return;
+  S.attackAt = now;
+  S.lastHit = S.inRange;
+  if (S.inRange) S.hitAt = now; else S.missAt = now;
+}
+
+function computeScene(now) {
+  const time = (now - S.start) / 1000;
+  const dt = Math.min(0.05, (now - S.last) / 1000);
+  S.last = now;
+  const z = zone();
+  let ex, phaseAlpha = 1, autoAttack = false;
+  if (ui.auto.checked) {
+    const ph = time % PERIOD;
+    if (S.lastPhase < ATK && ph >= ATK) autoAttack = true;
+    S.lastPhase = ph;
+    const t = clamp(ph / ENTER, 0, 1);
+    ex = lerp(W + 30, z.c, 1 - Math.pow(1 - t, 3));
+    phaseAlpha = ph < ATK + 0.42 ? 1 : 0;
+  } else {
+    ex = lerp(PX + 34, W + 30, ui.pos.value / 1000);
+  }
+  const hitAge = (now - S.hitAt) / 1000;
+  const hitAlpha = hitAge < 0.4 ? 1 - hitAge / 0.4 : hitAge < 0.8 ? 0 : clamp((hitAge - 0.8) / 0.3, 0, 1);
+  const eAlpha = Math.min(phaseAlpha, hitAlpha);
+  const eL = ex - EW / 2, eR = ex + EW / 2;
+  const inRange = eL >= z.x && eR <= z.r && eAlpha > 0.6;
+  const partial = !inRange && eAlpha > 0.6 && eR > z.x && eL < z.r;
+  let near = eL > z.r ? clamp(1 - (eL - z.r) / 170, 0, 1) : 1;
+  near = near * near * eAlpha;
+  S.hot += ((inRange ? 1 : 0) - S.hot) * Math.min(1, dt * 14);
+  S.inRange = inRange;
+  if (autoAttack) attack(now);
+  const bt = time / 0.5;
+  return {
+    time, ex, eAlpha, inRange, partial, near, z, hot: S.hot,
+    pulse: Math.exp(-(bt % 1) * 5), beatIdx: Math.floor(bt),
+    attackAge: (now - S.attackAt) / 1000, hitAge, missAge: (now - S.missAt) / 1000,
+  };
+}
+
+// ---------- 通用绘制 ----------
+function drawGround(ctx) {
+  ctx.strokeStyle = INK; ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+  ctx.beginPath(); groundPath(ctx, 0, W); ctx.stroke();
+}
+
+function drawPlayer(ctx, s) {
+  const x = PX, by = groundY(PX);
+  ctx.save();
+  ctx.strokeStyle = INK; ctx.lineWidth = 2.4; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const sw = Math.sin(s.time * 9) * 7;
+  ctx.beginPath(); ctx.arc(x + 2, by - 61, 12, 0, Math.PI * 2); ctx.stroke();
+  line(ctx, x + 1, by - 49, x - 1, by - 25);
+  line(ctx, x - 1, by - 25, x - 8 + sw, by);
+  line(ctx, x - 1, by - 25, x + 8 - sw, by);
+  line(ctx, x, by - 43, x - 11, by - 31);
+  const atk = s.attackAge < 0.28 ? s.attackAge / 0.28 : -1;
+  let hx = x + 11, hy = by - 33, ang = -1.0;
+  if (atk >= 0) { hx = x + 14; hy = by - 38; ang = -1.6 + atk * 2.4; }
+  line(ctx, x, by - 43, hx, hy);
+  ctx.lineWidth = 2;
+  line(ctx, hx, hy, hx + Math.cos(ang) * 20, hy + Math.sin(ang) * 20);
+  ctx.restore();
+}
+
+function drawEnemy(ctx, s, outline) {
+  if (s.eAlpha <= 0.01) return;
+  const cx = s.ex, by = groundY(cx);
+  ctx.save();
+  ctx.globalAlpha = s.eAlpha;
+  ctx.lineJoin = 'round'; ctx.lineCap = 'round';
+  if (outline > 0.01) {
+    enemyPath(ctx, cx, by);
+    ctx.strokeStyle = col(0.9 * outline, 1); ctx.lineWidth = 8; ctx.stroke();
+  }
+  ctx.strokeStyle = INK; ctx.lineWidth = 2.2;
+  line(ctx, cx - 8, by - 9, cx - 9, by);
+  line(ctx, cx + 8, by - 9, cx + 9, by);
+  enemyPath(ctx, cx, by);
+  ctx.fillStyle = s.hitAge < 0.12 ? '#fff4e0' : '#ece5d3';
+  ctx.fill(); ctx.stroke();
+  ctx.fillStyle = INK;
+  for (const ox of [-9, 3]) { ctx.beginPath(); ctx.arc(cx + ox, by - 40, 2.6, 0, Math.PI * 2); ctx.fill(); }
+  line(ctx, cx - 10, by - 27, cx - 1, by - 28);
+  ctx.restore();
+}
+
+function drawAttackFx(ctx, s) {
+  if (s.attackAge < 0.3) {
+    const cx = PX + 2, cy = groundY(PX) - 40, R = s.z.r - cx + 6;
+    const prog = clamp(s.attackAge / 0.12, 0, 1);
+    const fade = 1 - clamp((s.attackAge - 0.12) / 0.18, 0, 1);
+    const c = S.lastHit ? HOT : [43, 43, 43];
+    ctx.save(); ctx.lineCap = 'round';
+    for (let i = 0; i < 3; i++) {
+      ctx.strokeStyle = `rgba(${c},${(0.6 - i * 0.17) * fade})`;
+      ctx.lineWidth = 6 - i * 2;
+      ctx.beginPath(); ctx.arc(cx, cy, R - i * 5, -1.1, lerp(-1.1, 0.45, prog)); ctx.stroke();
+    }
+    ctx.restore();
+  }
+  if (S.lastHit && s.hitAge < 0.45) {
+    const cx = s.ex, cy = groundY(s.ex) - 40, a = 1 - s.hitAge / 0.45;
+    ctx.save(); ctx.strokeStyle = `rgba(${HOT},${a})`; ctx.lineWidth = 2; ctx.lineCap = 'round';
+    for (let i = 0; i < 16; i++) {
+      const ang = i * 2.39996, d = (70 + hash(i) * 90) * s.hitAge;
+      const dx = Math.cos(ang), dy = Math.sin(ang) * 0.8;
+      line(ctx, cx + dx * d, cy + dy * d, cx + dx * (d + 7), cy + dy * (d + 7));
+    }
+    ctx.restore();
+  }
+  if (s.missAge < 0.7) {
+    ctx.save();
+    ctx.font = '12px "Microsoft YaHei", sans-serif'; ctx.textAlign = 'left';
+    ctx.fillStyle = `rgba(43,43,43,${0.7 * (1 - s.missAge / 0.7)})`;
+    ctx.fillText('不在范围内，攻击无效', PX - 20, groundY(PX) - 92 - s.missAge * 18);
+    ctx.restore();
+  }
+}
+
+function drawTag(ctx, s) {
+  const txt = s.inRange ? '全身进入 · 可攻击' : s.partial ? '部分进入 · 不可攻击' : '范围外';
+  ctx.save();
+  ctx.font = '12px "Microsoft YaHei", sans-serif'; ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+  ctx.fillStyle = s.inRange ? col(1, 1) : 'rgba(43,43,43,0.45)';
+  ctx.fillText(txt, W - 12, 10);
+  ctx.restore();
+}
+
+// ---------- 各方案的范围绘制 ----------
+function drawRect(ctx, s) {
+  const z = s.z, gy = groundY(z.c);
+  ctx.strokeStyle = s.hot > 0.5 ? col(0.95, 1) : 'rgba(43,43,43,0.55)';
+  ctx.lineWidth = 1.8;
+  ctx.strokeRect(z.x, gy - z.h, z.w, z.h);
+}
+
+function drawCorners(ctx, s) {
+  const z = s.z, k = s.hot, gy = groundY(z.c), egy = groundY(s.ex);
+  const L = lerp(z.x, s.ex - EW / 2 - 5, k), R = lerp(z.r, s.ex + EW / 2 + 5, k);
+  const T = lerp(gy - z.h, egy - EH - 7, k), B = lerp(gy, egy + 3, k);
+  const len = 9 + 3 * k;
+  ctx.save();
+  ctx.strokeStyle = col(0.22 + 0.45 * s.near + 0.33 * k, k);
+  ctx.lineWidth = 2 + k; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const corner = (x, y, dx, dy) => {
+    ctx.beginPath(); ctx.moveTo(x + dx * len, y); ctx.lineTo(x, y); ctx.lineTo(x, y + dy * len); ctx.stroke();
+  };
+  corner(L, T, 1, 1); corner(R, T, -1, 1); corner(L, B, 1, -1); corner(R, B, -1, -1);
+  ctx.restore();
+}
+
+function drawStrip(ctx, s, beat = false) {
+  const z = s.z, k = s.hot, gy = groundY(z.c);
+  const a = 0.18 + 0.4 * s.near + 0.35 * k + (beat ? 0.18 * s.pulse : 0);
+  const gh = lerp(20, z.h * 0.85, k) + (beat ? 6 * s.pulse : 0);
+  const g = ctx.createLinearGradient(0, gy, 0, gy - gh);
+  g.addColorStop(0, col(a * 0.5, k)); g.addColorStop(1, col(0, k));
+  ctx.save();
+  ctx.fillStyle = g;
+  ctx.beginPath(); groundPath(ctx, z.x, z.r); ctx.lineTo(z.r, gy - gh); ctx.lineTo(z.x, gy - gh); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = col(a + 0.3, k); ctx.lineWidth = 4.5; ctx.lineCap = 'round';
+  ctx.beginPath(); groundPath(ctx, z.x + 2, z.r - 2); ctx.stroke();
+  ctx.restore();
+}
+
+function drawGhost(ctx, s) {
+  const z = s.z, k = s.hot, gy = groundY(z.c);
+  const sx = z.w / EW, sy = 1 + (sx - 1) * 0.2;
+  const a = (0.25 + 0.45 * s.near) * (1 - k);
+  if (a < 0.01) return;
+  ctx.save();
+  enemyPath(ctx, z.c, gy, sx, sy);
+  ctx.fillStyle = col(a * 0.15, 0); ctx.fill();
+  ctx.setLineDash([5, 4]); ctx.lineDashOffset = -s.time * 14;
+  ctx.strokeStyle = col(a, 0); ctx.lineWidth = 1.8; ctx.lineJoin = 'round'; ctx.stroke();
+  ctx.restore();
+}
+
+function drawArc(ctx, s) {
+  const z = s.z, k = s.hot;
+  const cx = PX + 2, cy = groundY(PX) - 40;
+  const r1 = z.x - cx, r2 = z.r - cx;
+  const a0 = -0.8, a1 = Math.asin(clamp(36 / r2, 0, 1));
+  const N = 32;
+  const thick = a => Math.sin(Math.PI * (a < 0 ? (a - a0) / -a0 * 0.5 : 0.5 + a / a1 * 0.5));
+  ctx.save();
+  ctx.beginPath();
+  for (let i = 0; i <= N; i++) { const a = lerp(a0, a1, i / N); ctx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2); }
+  for (let i = N; i >= 0; i--) {
+    const a = lerp(a0, a1, i / N), r = r2 - (r2 - r1) * thick(a);
+    ctx.lineTo(cx + Math.cos(a) * r, cy + Math.sin(a) * r);
+  }
+  ctx.closePath();
+  const al = 0.14 + 0.3 * s.near + 0.4 * k;
+  const g = ctx.createRadialGradient(cx, cy, r1, cx, cy, r2);
+  g.addColorStop(0, col(0, k)); g.addColorStop(1, col(al * 0.6, k));
+  ctx.fillStyle = g; ctx.fill();
+  ctx.beginPath(); ctx.arc(cx, cy, r2, a0, a1);
+  ctx.strokeStyle = col(al + 0.25, k); ctx.lineWidth = 2; ctx.lineCap = 'round'; ctx.stroke();
+  ctx.restore();
+}
+
+function drawBeat(ctx, s) {
+  const z = s.z, k = s.hot, p = s.pulse;
+  const a = 0.28 + 0.35 * s.near + 0.35 * k;
+  ctx.save(); ctx.lineCap = 'round';
+  for (const x of [z.x, z.r]) {
+    const gy = groundY(x);
+    const g = ctx.createLinearGradient(0, gy, 0, gy - z.h);
+    g.addColorStop(0, col(a + 0.25 * p, k)); g.addColorStop(1, col(0, k));
+    ctx.strokeStyle = g; ctx.lineWidth = 1.5 + 1.2 * k + 0.8 * p;
+    line(ctx, x, gy, x, gy - z.h);
+  }
+  const n = 5, step = z.w / (n + 1);
+  ctx.fillStyle = col(a * 0.9, k);
+  for (let i = 1; i <= n; i++) {
+    const x = z.x + step * i, gy = groundY(x);
+    const h = 2 + (5 + 12 * k) * p * (0.35 + 0.65 * hash(s.beatIdx * 7 + i));
+    ctx.fillRect(x - 2, gy + 3, 4, h);
+  }
+  ctx.restore();
+}
+
+// ---------- 方案列表 ----------
+const VARIANTS = [
+  { title: 'A · 原方案：完整长方形（对照）', back: drawRect,
+    desc: '信息最直接，但四条硬边把怪物“关”在框里，像程序调试时用的碰撞盒，和手绘场景不搭。',
+    ref: '对照组' },
+  { title: 'B · 四角取景框', back: drawCorners,
+    desc: '只留四个角，线条少了一大半；平时很淡，怪物靠近时渐显，全身进入后四角收紧、变色，像“锁定目标”。',
+    ref: '参考：相机对焦框；动作游戏锁定目标时出现在敌人周围的角标' },
+  { title: 'C · 地面光带', back: (c, s) => drawStrip(c, s),
+    desc: '范围只画在地面上，光往上渐隐。不挡怪物，也不挡飞来的箭，画面最干净。',
+    ref: '参考：《王者荣耀》《英雄联盟》的技能范围指示器' },
+  { title: 'D · 怪物轮廓虚影', back: drawGhost, outline: s => s.hot,
+    desc: '用虚线画出“怪物站在这里就能打到”的轮廓，最贴近文档原文“以怪物身体轮廓呈现”。进入后虚影消失，怪物自身亮边。',
+    ref: '参考：建造类游戏的放置预览、音游里的落点提示' },
+  { title: 'E · 刀光弧', back: drawArc,
+    desc: '一道淡淡的刀光弧，胸口高度正好覆盖攻击范围，意思就是“我的刀够得着这里”，和近战动作最贴。',
+    ref: '参考：《空洞骑士》骨钉挥砍、《死亡细胞》武器挥动轨迹' },
+  { title: 'F · 节拍判定线', back: drawBeat,
+    desc: '两条细竖线标出边界，地面下的小音柱随节拍跳动，把攻击范围和音乐绑在一起，最贴“音魂游”的主题。',
+    ref: '参考：音游的判定线、《节奏地牢》底部节拍条、《完美音浪》场景随拍点律动' },
+  { title: '推荐组合 · 地面光带（随拍轻微呼吸）＋ 怪物进入后自身亮边', pick: true,
+    back: (c, s) => drawStrip(c, s, true), outline: s => s.hot,
+    desc: '平时只有地面一条很淡的光带，不抢视线；怪物全身进入的瞬间，怪物自己亮起橙色描边，玩家看怪物就知道“现在能打”，不用盯着范围框。',
+    ref: '思路：范围提示负责“在哪里”，怪物亮边负责“现在能不能打”，两件事分开表达' },
+];
+
+const dpr = Math.min(2, window.devicePixelRatio || 1);
+const cards = VARIANTS.map(v => {
+  const el = document.createElement('div');
+  el.className = 'card' + (v.pick ? ' pick' : '');
+  el.innerHTML = `<canvas width="${W * dpr}" height="${H * dpr}"></canvas>
+    <div class="meta"><h2>${v.title}</h2><p>${v.desc}</p><p class="ref">${v.ref}</p></div>`;
+  ui.grid.appendChild(el);
+  const canvas = el.querySelector('canvas');
+  canvas.addEventListener('pointerdown', () => attack(performance.now()));
+  return { v, ctx: canvas.getContext('2d') };
+});
+
+function updateWindowText() {
+  const m = EW * zoneMul - EW;
+  ui.wv.textContent = zoneMul.toFixed(2);
+  ui.win.textContent = `范围比怪物宽 ${m.toFixed(0)}px（每边约 ${(m / 2).toFixed(0)}px）。` +
+    `假设人物匀速前进、每秒跑过 4 个怪物宽度，那么站着不动的弓箭怪“全身都在范围内”只持续约 ${(m / ASSUMED_SPEED).toFixed(2)} 秒。`;
+}
+
+ui.pos.addEventListener('input', () => { ui.auto.checked = false; });
+ui.w.addEventListener('input', () => { zoneMul = ui.w.value / 100; updateWindowText(); });
+updateWindowText();
+
+function frame(now) {
+  const s = computeScene(now);
+  for (const { v, ctx } of cards) {
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = PAPER; ctx.fillRect(0, 0, W, H);
+    drawGround(ctx);
+    v.back(ctx, s);
+    drawPlayer(ctx, s);
+    drawEnemy(ctx, s, v.outline ? v.outline(s) : 0);
+    drawAttackFx(ctx, s);
+    drawTag(ctx, s);
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
